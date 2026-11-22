@@ -21,11 +21,6 @@ Binary extension fields are simple to specify, map naturally onto bit-level oper
 
 Beyond leanPCS, `MULFIELD` is useful for standalone binary-field STARK/WHIR/Binius verifiers and binary-field Reed–Solomon coding in smart contracts.
 
-## WARNING (TODO delete this)
-
-- The field $\mathrm{GF}(2^{192})$ may be replaced by $\mathrm{GF}(2^{128})$ in lockstep with leanPCS. This EIP is kept in Draft alongside leanPCS until the field choice is finalized.
-- Gas pricing is not finalized.
-
 ## Specification
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174).
