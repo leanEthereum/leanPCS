@@ -1,6 +1,6 @@
 ---
 title: leanPCS
-description: Cheap verification of STARKs thanks to aggregation of PCS openings and a new MULFIELD instruction
+description: Cheap verification of STARKs thanks to aggregation of PCS openings
 author: Greg Hirsch
 discussions-to: https://ethereum-magicians.org/t/TBD
 status: Draft
@@ -12,13 +12,13 @@ requires: 8141, 8288
 
 ## Abstract
 
-This EIP lets a transaction declare PCS claims ("PCS" for "Polynomial Commitment Scheme"), each stating that a committed multilinear polynomial takes a given value at a given point, as [EIP-8288](./eip-8288.md) dependencies of [EIP-8141](./eip-8141.md) frame transactions. Contracts read the declared claims through frame and signature introspection, and the block proves them. This EIP also introduces a new EVM instruction `MULFIELD` that multiplies two elements of the finite field $\mathrm{GF}(2^{192})$. Together, they let users cheaply verify STARKs (post-quantum, hash-based SNARKs) onchain. All the heavy PCS opening proofs of a block are aggregated into a single STARK.
+This EIP lets a transaction declare PCS claims ("PCS" for "Polynomial Commitment Scheme"), each stating that a committed multilinear polynomial takes a given value at a given point, as [EIP-8288](./eip-8288.md) dependencies of [EIP-8141](./eip-8141.md) frame transactions. Contracts read the declared claims through frame and signature introspection, and the block proves them. Paired with the companion [`MULFIELD`](./eip-draft-mulfield.md) instruction for $\mathrm{GF}(2^{192})$ multiplication, this lets users cheaply verify STARKs (post-quantum, hash-based SNARKs) onchain. All the heavy PCS opening proofs of a block are aggregated into a single STARK.
 
 ## Motivation
 
 Today, verifying a pre-quantum SNARK onchain costs about 200,000 gas thanks to the elliptic-curve precompiles. Post-quantum STARKs are much larger, and much more expensive to verify. Recursive aggregation amortizes this cost: a single STARK per block proves all the others. [EIP-8288](./eip-8288.md) was initially designed to aggregate whole STARKs, which would require enshrining a STARK-friendly ISA such as RISC-V.
 
-Most of a STARK verification, in proof size and in verification time, is simply PCS openings. With this EIP, Ethereum aggregates this heavy part, and smart contracts run the cheap remaining part of the STARK verification in the EVM. This rest is called the "polynomial interactive oracle proof" (PIOP). The PIOP mostly computes a few hashes (for Fiat-Shamir) and does arithmetic in some finite field. We pick binary fields for their simplicity and their state of the art performance. The EVM can already add field elements with `XOR` (`0x18`). For efficient field multiplication, we introduce a new `MULFIELD` EVM instruction.
+Most of a STARK verification, in proof size and in verification time, is simply PCS openings. With this EIP, Ethereum aggregates this heavy part, and smart contracts run the cheap remaining part of the STARK verification in the EVM. This rest is called the "polynomial interactive oracle proof" (PIOP). The PIOP mostly computes a few hashes (for Fiat-Shamir) and does arithmetic in some finite field. We pick binary fields for their simplicity and their state of the art performance. The EVM can already add field elements with `XOR` (`0x18`). For efficient field multiplication, contracts use the companion [`MULFIELD`](./eip-draft-mulfield.md) instruction.
 
 The goal of this EIP is to get most of the benefits (cheap onchain STARK verification) from [EIP-8288](./eip-8288.md) without the complexity of enshrining a new ISA.
 
@@ -47,10 +47,6 @@ The other constants, dependency verification frames, the recursive STARK and mem
 ### Fields
 
 Let $K = \mathrm{GF}(2)[Y] / (Y^{64} + Y^4 + Y^3 + Y + 1)$ and $E = K[X] / (X^3 + X + 1)$. An element of $K$ is encoded as a 64-bit integer whose bit $j$ is the coefficient of $Y^j$. An element $a + bX + cX^2$ of $E$, with $a, b, c \in K$, is encoded as the word `a | (b << 64) | (c << 128)`, and in bytes as that word's low 24 bytes, big-endian.
-
-### `MULFIELD`
-
-The instruction `MULFIELD` (`0x1f`) pops `a` (the top of the stack) and then `b`, ignores their top 64 bits, and pushes their product in $E$ (the product is commutative, so the order does not matter). It costs 10 gas.
 
 ### PCS claims
 
@@ -106,7 +102,7 @@ In a transaction eligible for EIP-8141's public mempool, dependency verification
 
 ### Benchmarks
 
-Gas follows EIP-8141 with [EIP-7976](./eip-7976.md)'s calldata floor, without the per-transaction and per-frame overheads: *PIOP* is the PIOP's frame, *Total* adds the frame of PCS claims and `pcs_gas`. *Prover* adds 0.1 s per claim for aggregating, client side, every PCS opening, into a common STARK.
+Gas follows EIP-8141 with [EIP-7976](./eip-7976.md)'s calldata floor (with [`MULFIELD`](./eip-draft-mulfield.md) at 10 gas), without the per-transaction and per-frame overheads: *PIOP* is the PIOP's frame, *Total* adds the frame of PCS claims and `pcs_gas`. *Prover* adds 0.1 s per claim for aggregating, client side, every PCS opening, into a common STARK.
 
 | Application | Prover (Apple M4 Max) | Calldata | PIOP | PCS claims | Total |
 |---|---|---|---|---|---|
@@ -151,35 +147,9 @@ To migrate a stored commitment `com` (version $v$) to `com'` (version $v + 1$, s
 
 ## Backwards Compatibility
 
-`MULFIELD` uses the opcode `0x1f`, which was previously undefined: executing it halted exceptionally. This EIP replaces the dependency format, the gas of PCS dependencies and the `LEANSTARK_SCHEME` of EIP-8288, which is not yet deployed. Nothing changes for existing transactions.
+This EIP replaces the dependency format, the gas of PCS dependencies and the `LEANSTARK_SCHEME` of EIP-8288, which is not yet deployed. Nothing changes for existing transactions.
 
 ## Reference Implementation
-
-### `MULFIELD`
-
-```python
-def mul_k(a, b):  # multiplication in K
-    r = 0
-    for i in range(64):
-        if (b >> i) & 1:
-            r ^= a << i
-    for i in range(126, 63, -1):  # reduce by Y^64 + Y^4 + Y^3 + Y + 1
-        if (r >> i) & 1:
-            r ^= ((1 << 64) | 0b11011) << (i - 64)
-    return r
-
-def mulfield(a, b):  # multiplication in E
-    x = [(a >> (64 * i)) & (2**64 - 1) for i in range(3)]
-    y = [(b >> (64 * i)) & (2**64 - 1) for i in range(3)]
-    c = [0] * 5
-    for i in range(3):
-        for j in range(3):
-            c[i + j] ^= mul_k(x[i], y[j])
-    for d in (4, 3):  # X^d = X^(d-2) + X^(d-3)
-        c[d - 2] ^= c[d]
-        c[d - 3] ^= c[d]
-    return c[0] | (c[1] << 64) | (c[2] << 128)
-```
 
 ### PCS claims
 
