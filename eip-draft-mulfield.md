@@ -37,7 +37,7 @@ Let:
 - $K = \mathrm{GF}(2)[Y] / (Y^{64} + Y^4 + Y^3 + Y + 1)$
 - $E = K[X] / (X^3 + X + 1)$
 
-An element $\sum_{j=0}^{63} b_j Y^j \in K$ (with $b_j \in \{0, 1\}$) is encoded as the 64-bit unsigned integer $\sum_{j=0}^{63} b_j 2^j$ (bit $j$ is the coefficient of $Y^j$).
+An element of $K$ is encoded as a 64-bit unsigned integer whose bit $j$ ($0 \le j \le 63$) is the coefficient of $Y^j$ (bit 0 is the constant term and bit 63 is the coefficient of $Y^{63}$).
 
 An element $a + bX + cX^2 \in E$ (with $a, b, c \in K$) is encoded as the 256-bit EVM word:
 
