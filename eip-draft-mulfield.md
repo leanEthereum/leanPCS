@@ -121,7 +121,7 @@ def mulfield(a, b):  # multiplication in E (ignores top 128 bits; top 128 bits o
 
 ## Security Considerations
 
-- **Ignored top 128 bits and malleability.** Because `MULFIELD` ignores bits 128–255 of its operands, contracts that read field elements from unmasked 32-byte words (for example from calldata or EIP-8141 `ARBITRARY` signature entries) MUST mask or reject nonzero top 128 bits whenever canonical encoding is required (such as before `EQ` comparisons or to prevent transaction/proof malleability).
+- **Ignored top 128 bits and malleability.** Because `MULFIELD` ignores bits 128–255 of its operands, contracts that read field elements from unmasked 32-byte words (for example from calldata, including a glue's witness bytes) MUST mask or reject nonzero top 128 bits whenever canonical encoding is required (such as before `EQ` comparisons or to prevent transaction/proof malleability).
 - **Denial-of-service / gas pricing.** `MULFIELD` is a pure, fixed-width arithmetic instruction with no memory or state side effects. Its gas cost must be set high enough to prevent worst-case execution or L1 zkEVM proving DoS across client architectures, including hosts without hardware carry-less multiplication instructions.
 
 ## Copyright
