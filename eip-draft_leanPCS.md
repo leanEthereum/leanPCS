@@ -65,7 +65,7 @@ We start at version `1`: the zero-knowledge variant (ZK-WHIR) of leanVM's WHIR o
 
 ### leanPCS claims
 
-A STARK check has a cheap part, the PIOP, and a heavy part, the PCS openings. A **glue** contract runs the PIOP in the EVM and outputs a **statement**, the hash of the PCS claims that the openings must prove. The block proves all statements with one recursive STARK ([EIP-8288](./eip-8288.md)). The protocol verifier `LEANPCS_VERIFIER` ties the two together, so a contract checks the whole STARK with one `HASCLAIM`.
+A **glue** contract runs the PIOP in the EVM and outputs a **statement**, the hash of the PCS claims that the openings must prove; the block proves all statements with one recursive STARK ([EIP-8288](./eip-8288.md)).
 
 ```
 statement = keccak256(keccak256(c_0) || ... || keccak256(c_{k-1}))   # PCS claims c_i, 1 <= k <= MAX_PCS_CLAIMS_PER_STATEMENT
@@ -76,54 +76,51 @@ A statement is **true** if every `c_i` is well-formed and holds. `glue_key` is w
 
 #### The claim
 
-A leanPCS claim is the EIP-8141 claim `[LEANPCS_VERIFIER, glue_id, msg, gas_limit, witness_len]`. A transaction is invalid if one breaks these bounds:
+A leanPCS claim is the EIP-8141 claim `[LEANPCS_VERIFIER, glue_id, msg, gas_limit, witness_len]`. `msg` is as in EIP-8141: empty for `compute_sig_hash(tx)`, or an explicit non-zero 32-byte message. `gas_limit` is the glue's execution gas, charged in full. `witness_len` is the witness's exact length. The transaction is invalid unless `len(glue_id) == 32`, `0 < gas_limit < 2**64` and `84 <= witness_len <= MAX_CLAIM_WITNESS_BYTES`.
 
-- `glue_id` is 32 bytes and names the glue and its key;
-- `msg` is as in EIP-8141: empty for `compute_sig_hash(tx)`, or an explicit non-zero 32-byte message;
-- `gas_limit` is the glue's execution gas, charged in full, with `0 < gas_limit < 2**64`;
-- `witness_len` is the exact length of the witness, with `84 <= witness_len <= MAX_CLAIM_WITNESS_BYTES`.
-
-Its witness is `statement (32 bytes) || glue (20 bytes) || glue_key (32 bytes) || transcript`. The claim holds if and only if:
+Its witness is `statement (32 bytes) || glue (20 bytes) || glue_key (32 bytes) || transcript`. EIP-8141's `verify_dependency` checks a leanPCS dependency with:
 
 ```python
-def leanpcs_claim_holds(claim, witness, resolved_msg, state, proven) -> bool:
+def verify_leanpcs_dependency(dep, witness, state, proven) -> bool:
+    _, key, msg, gas, witness_len = dep       # gas = gas_limit + PCS_STATEMENT_GAS
+    if len(witness) != witness_len:
+        return False
     statement, glue, glue_key, transcript = witness[:32], witness[32:52], witness[52:84], witness[84:]
     # No EVM needed for these two checks.
-    if keccak256(glue + glue_key) != claim.key:
+    if keccak256(glue + glue_key) != key:
         return False
     if statement not in proven:
         return False
-    # Run the glue like an EIP-8141 custom verifier (pure context, own access sets,
-    # entry access charged from gas_limit), and require it to return the statement.
-    if is_precompile(glue) or code_is_empty_or_delegated(state, glue):
+    # Run the glue as EIP-8141 runs a custom verifier, and require it to return the statement.
+    if is_precompile(glue):
         return False
-    ok, output = execute_pure_verifier(glue, glue_key + resolved_msg + transcript, claim.gas_limit, state)
+    ok, output = execute_pure_verifier(glue, glue_key + msg + transcript, gas - PCS_STATEMENT_GAS, state)
     return ok and output == statement
 ```
 
-`state` is the block's pre-state, or the pool's current state in a mempool. `proven` is the set of statements that a valid proof covers: the transaction's `statements_proof` in a mempool, the block's `aggregate` in a block.
+`state` is the block's pre-state, or the pool's current state in a mempool. `execute_pure_verifier` returns whether the call succeeded and its return data; it already fails on empty or delegated code. `proven` is every statement in `D` (below) if the proof covers `D`, and empty otherwise. The proof is the transaction's `statements_proof` in a mempool, the block's `aggregate` in a block.
 
 #### Proving statements
 
-- **Dependency.** Each statement is the EIP-8288 dependency `(LEANSTARK_SCHEME, statement, PCS_VK_HASH)`, read from the witness rather than declared in a frame. `PCS_VK_HASH` names one relation, fixed by the fork: given PCS claims `c_0, ..., c_{k-1}` and their opening proofs, `pcs_verify(c_i, opening_proof_i)` holds for every `i` and the `c_i` hash to `statement`. EIP-8288's recursive STARK proves these dependencies from this relation, or from inner recursive STARKs, under `AGGREGATED_VK`.
-- **Coverage.** The statements `D` of a transaction or a block are the dependencies of its leanPCS witnesses, deduplicated and sorted; in a block, `D` also includes EIP-8288's `dependencies(block)`. A proof **covers** `D` if it verifies under `AGGREGATED_VK` with public inputs `[get_deps_hash(D), AGGREGATED_VK]`.
+- **Dependency.** Each statement is the EIP-8288 dependency `(LEANSTARK_SCHEME, statement, PCS_VK_HASH)`, read from the witness rather than declared in a frame. The circuit identified by `PCS_VK_HASH`, fixed by the fork, takes PCS claims `c_0, ..., c_{k-1}` and their opening proofs, and checks `1 <= k <= MAX_PCS_CLAIMS_PER_STATEMENT`, `pcs_verify(c_i, opening_proof_i)` for every `i`, and that the ordered `c_i` hash to `statement`. EIP-8288's recursive STARK proves these dependencies from this circuit, or from inner recursive STARKs, under `AGGREGATED_VK`.
+- **Coverage.** The dependencies `D` of a transaction are `(LEANSTARK_SCHEME, w[:32], PCS_VK_HASH)` for each of its leanPCS witnesses `w`, sorted and deduplicated. For a block, `D` also includes EIP-8288's `dependencies(block)`. A proof **covers** `D` if it verifies under `AGGREGATED_VK` with public inputs `[get_deps_hash(D), AGGREGATED_VK]`.
 - **One digest encoding.** This EIP replaces EIP-8288's `get_deps_hash` for every list, in headers, wrappers, recursion and discards: `get_deps_hash(deps) = DEPS_HASH(concat(scheme || data_hash || verification_key_hash for each triple))`, with `scheme` as 31 zero bytes then the scheme byte, so lists of different schemes never share an encoding. Frames naming `LEANSTARK_SCHEME` stay invalid, and EIP-8288's leanSTARK limits and gas do not apply to statements.
 
 #### Transport
 
 - **Pooled wrapper.** A transaction with a leanPCS claim travels in pooled wrapper version `1`, `FRAME_TX_TYPE || rlp([tx_body, 1, witnesses, blob_sidecar, statements_proof])`. `statements_proof`, at most `MAX_PCS_PROOF_BYTES`, covers the transaction's statements. At EIP-8141's acceptance step 2, a node rejects a version `0` wrapper of such a transaction and a version `1` wrapper of any other. At step 5, before reading any state, it checks every `glue_id` and the `statements_proof`. At step 6, it runs each glue. A failing wrapper is rejected; its `tx_hash` is not marked invalid.
-- **Block.** A block with a leanPCS claim carries `dependency_proof` version `1`, `0x01 || rlp([witnesses, aggregate])`, canonical with no trailing bytes. `witnesses` is as in version `0`, one raw witness per dependency in `block_dependencies(block)`, leanPCS witnesses included, since validators run their glue. `aggregate`, at most `MAX_PCS_PROOF_BYTES`, is EIP-8288's dependency proof and MUST cover the block's `D`, with `block_deps_hash = get_deps_hash(D)`. Otherwise, or with any other `dependency_proof` version, the block is invalid.
+- **Block.** A block with a leanPCS claim carries `dependency_proof` version `1`, `0x01 || rlp([witnesses, aggregate])`, canonical with no trailing bytes. `witnesses` is as in version `0`, one raw witness per dependency in `block_dependencies(block)`, leanPCS witnesses included, since validators run their glue. `aggregate`, at most `MAX_PCS_PROOF_BYTES`, is EIP-8288's dependency proof, and `block_deps_hash = get_deps_hash(D)`. A block with a leanPCS claim is invalid if `aggregate` does not cover `D`, or if its `dependency_proof` has another version.
 
 #### Changes to EIP-8141
 
 - **Gas and length.** Unlike EIP-8141's other protocol verifiers, `LEANPCS_VERIFIER` takes its gas and witness length from the claim: its `resolve_claim_gas` is `gas_limit + PCS_STATEMENT_GAS`, and its `resolve_witness_len` is `witness_len`. `PCS_STATEMENT_GAS` pays for verifying and aggregating one statement. The witness is priced as a custom verifier's witness. `statements_proof` is not charged by the byte: it never reaches a block.
-- **Evaluation.** Unlike the others, a leanPCS claim is never evaluated without the EVM: it always runs its glue.
+- **Evaluation.** EIP-8141's direct evaluation never applies to a leanPCS claim: a node always runs its glue, and a proof alone never satisfies the claim.
 - **`MULFIELD`** is permitted in the pure context.
 
 ### Using leanPCS claims
 
 - **A proof that signs its transaction.** An account stores its `glue_id` and checks `HASCLAIM(LEANPCS_VERIFIER, glue_id, 0)`. The glue runs the PIOP against `compute_sig_hash(tx)`, so it must fit the account's validation gas.
-- **An application proof.** An application whose PIOP does not depend on `compute_sig_hash(tx)` can run the PIOP in its own frame, with state access and no validation gas limit. It uses an **echo glue**: a contract `ECHO_GLUE`, pinned by the application, that always returns bytes 32 to 63 of its calldata (`resolved_msg`). The transaction declares `[LEANPCS_VERIFIER, keccak256(ECHO_GLUE || bytes32(0)), statement, gas_limit, 84]` with witness `statement || ECHO_GLUE || bytes32(0)`. The application checks the PIOP, computes `statement` itself and checks `HASCLAIM(LEANPCS_VERIFIER, keccak256(ECHO_GLUE || bytes32(0)), statement)`. Such a claim says only that `statement` is true, never that anything is authorized.
+- **An application proof.** An application whose PIOP does not depend on `compute_sig_hash(tx)` can run the PIOP in its own frame, with state access and no validation gas limit. It uses an **echo glue**: a contract `ECHO_GLUE`, pinned by the application, that always returns bytes 32 to 63 of its calldata (`resolved_msg`). The transaction declares `[LEANPCS_VERIFIER, keccak256(ECHO_GLUE || bytes32(0)), statement, gas_limit, 84]` with witness `statement || ECHO_GLUE || bytes32(0)`. The application binds its public inputs into the transcript, checks the PIOP, derives `statement` itself, and requires `HASCLAIM(LEANPCS_VERIFIER, keccak256(ECHO_GLUE || bytes32(0)), statement)`. Such a claim says only that `statement` is true, never that anything is authorized.
 
 A contract MUST name `LEANPCS_VERIFIER`, never the glue: a claim naming the glue as a custom verifier holds whenever the call succeeds, with no PCS claim proven. An echo that can return anything other than `resolved_msg` lets a forger pass another true statement under the application's `msg`.
 
