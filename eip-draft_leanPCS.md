@@ -12,7 +12,7 @@ requires: 8141, 8288
 
 ## Abstract
 
-This EIP lets a transaction declare PCS claims ("PCS" for "Polynomial Commitment Scheme"), each stating that a committed multilinear polynomial takes a given value at a given point, as [EIP-8288](./eip-8288.md) dependencies of [EIP-8141](./eip-8141.md) frame transactions. Contracts read the declared claims through frame and signature introspection, and the block proves them. Paired with the companion [`MULFIELD`](./eip-draft-mulfield.md) instruction for $\mathrm{GF}(2^{128})$ multiplication, this lets users cheaply verify STARKs (post-quantum, hash-based SNARKs) onchain. All the heavy PCS opening proofs of a block are aggregated into a single STARK.
+This EIP lets [EIP-8141](./eip-8141.md) transactions use STARKs (post-quantum, hash-based SNARKs) cheaply, including STARKs that sign their transaction. A STARK check splits into a cheap part (the PIOP), run by a **glue** contract in the EVM, and a heavy part (PCS openings, "PCS" for "Polynomial Commitment Scheme"), which every block aggregates into one STARK with [EIP-8288](./eip-8288.md). One new claim-only verifier, `LEANPCS_VERIFIER`, ties the two together, so contracts check a whole STARK with `HASCLAIM`, like a signature. The companion [`MULFIELD`](./eip-draft-mulfield.md) instruction makes the PIOP's $\mathrm{GF}(2^{128})$ arithmetic cheap.
 
 ## Motivation
 
@@ -32,16 +32,16 @@ The goal of this EIP is to get most of the benefits (cheap onchain STARK verific
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174).
 
-| Constant                     | Value  |
-|------------------------------|--------|
-| `PCS_SCHEME`                 | `0x12` |
-| `PCS_SIG_SCHEME`             | `0x13` |
-| `MAX_PCS_VARIABLES`          | `32`   |
-| `PCS_TX_GAS`                 | `5000` |
-| `PCS_CLAIM_GAS`              | `1000` |
-| `MAX_PCS_CLAIMS_PER_TX`      | `256`  |
+| Constant                       | Value             |
+|--------------------------------|-------------------|
+| `LEANPCS_VERIFIER`             | TBD               |
+| `MAX_PCS_VARIABLES`            | `32`              |
+| `MAX_PCS_CLAIMS_PER_STATEMENT` | `256`             |
+| `MAX_PCS_PROOF_BYTES`          | TBD               |
+| `PCS_STATEMENT_GAS`            | `6000` (provisional) |
+| `PCS_VK_HASH`                  | TBD               |
 
-The other constants, dependency verification frames, the recursive STARK and mempool wrappers come from EIP-8288, and frame transactions, their signature entries, `TXPARAM`, `FRAMEPARAM`, `FRAMEDATALOAD`, `SIGPARAM` and `SIGDATACOPY` from EIP-8141.
+EIP-8141 here is its claims-list version (kevaundray/EIPs#7): claims, segregated witnesses, custom verifiers, the pure context, `HASCLAIM`, the pooled wrapper and `dependency_proof` come from it. The recursive STARK comes from EIP-8288, which this EIP requires to be active.
 
 ### Fields
 
@@ -63,82 +63,106 @@ Each PCS version defines a verifier `pcs_verify(PCS_claim, opening_proof)`. It M
 
 We start at version `1`: the zero-knowledge variant (ZK-WHIR) of leanVM's WHIR over $E$, at rate 1/2 in the list-decoding regime. Version `1` is not specified here yet, including which `n` it supports; its verifier returns false for any `n` it does not support. The prototype in this repository (`crates/pcs_claim`, at commit `bb2da7f0`) has not moved to $E$ yet: it works over $\mathrm{GF}(2^{192})$ with one out-of-domain answer, supports `15 <= n <= 28`, and is not zero knowledge yet.
 
-### Dependencies
+### leanPCS claims
 
-This EIP replaces the dependency format of EIP-8288, its `(scheme, data_hash, verification_key_hash)` triples and its `LEANSTARK_SCHEME`. A dependency is `scheme (1 byte) || payload`, where the scheme fixes the payload's width:
+A **glue** contract runs the PIOP in the EVM and outputs a **statement**, the hash of the PCS claims that the openings must prove; the block proves all statements with one recursive STARK ([EIP-8288](./eip-8288.md)).
 
-| `scheme` | `payload` | The dependency holds if |
-|---|---|---|
-| `LEANSPHINCS_SCHEME` | `msg_hash (32 bytes) \|\| public_key (32 bytes)` | `public_key` signs `msg_hash` with leanSPHINCS |
-| `PCS_SCHEME` | `keccak256(PCS_claim)` (32 bytes) | `PCS_claim` holds |
+```
+statement = keccak256(keccak256(c_0) || ... || keccak256(c_{k-1}))   # PCS claims c_i, 1 <= k <= MAX_PCS_CLAIMS_PER_STATEMENT
+glue_id   = keccak256(glue || glue_key)                                # glue: 20-byte address, glue_key: 32 bytes
+```
 
-EIP-8288 applies, with these changes:
+A statement is **true** if every `c_i` is well-formed and holds. `glue_key` is whatever the glue interprets, for example the hash of an ML-DSA public key or a circuit's verification key.
 
-- **Frames.** A dependency verification frame is valid only if its `data` has one of two forms, with `1 <= k <= MAX_DEPENDENCIES_PER_FRAME`:
-  - `scheme || payload_0 || ... || payload_{k-1}`, with `scheme` one of the two above. It declares the dependencies `scheme || payload_j`.
-  - `PCS_SIG_SCHEME || s` (2 bytes), where `s` is the index of an `ARBITRARY` entry of `tx.signatures` with an empty `msg`, whose `signature` is `payload_0 || ... || payload_{k-1}`, 32 bytes each. It declares the dependencies `PCS_SCHEME || payload_j`, and is a frame of PCS dependencies.
-- **`dependencies(tx)`** is the list of the dependencies the transaction's frames declare, each `msg_hash` of 32 zero bytes replaced by `compute_sig_hash(tx)`, then deduplicated and sorted. Every list of dependencies (of a transaction, a block or a wrapper) is sorted byte by byte (lexicographic order).
-- **`get_deps_hash(deps)`** is `keccak256(concat(deps))`, in place of `DEPS_HASH`.
-- **The recursive STARK** proves a PCS dependency from a `PCS_claim` hashing to its payload and an `opening_proof` with `pcs_verify(PCS_claim, opening_proof)`. A false or ill-formed claim cannot be proven, so its transaction cannot be included.
-- **Limits.** A transaction declaring more than `MAX_PCS_CLAIMS_PER_TX` PCS dependencies, duplicates included, is invalid. PCS dependencies travel only in mode 1 wrappers.
-- **Gas.** leanSPHINCS dependencies are priced as in EIP-8288. A frame of PCS dependencies has `limits.execution = 0` and adds nothing to `recursive_stark_gas(tx)`. Instead, a transaction declaring `c > 0` PCS dependencies, duplicates included, adds `pcs_gas(tx) = PCS_TX_GAS + PCS_CLAIM_GAS * c` to both `frame_tx_intrinsic_gas` and `calldata_floor_gas` (EIP-8141).
+#### The claim
 
-This EIP also adds one rule to EIP-8141's `SIGDATACOPY` (TODO: move it to EIP-8141): on an entry with an empty `msg`, it halts exceptionally unless the frame being executed is a `VERIFY` frame. `compute_sig_hash(tx)` covers only the length of such an entry's `signature`, so anyone can change its bytes without changing that hash.
+A leanPCS claim is the EIP-8141 claim `[LEANPCS_VERIFIER, glue_id, msg, gas_limit, witness_len]`. `msg` is as in EIP-8141: empty for `compute_sig_hash(tx)`, or an explicit non-zero 32-byte message. `gas_limit` is the glue's execution gas, charged in full. `witness_len` is the witness's exact length. The transaction is invalid unless `len(glue_id) == 32`, `0 < gas_limit < 2**64` and `84 <= witness_len <= MAX_CLAIM_WITNESS_BYTES`.
 
-### Reading PCS claims
+Its witness is `statement (32 bytes) || glue (20 bytes) || glue_key (32 bytes) || transcript`. EIP-8141's `verify_dependency` checks a leanPCS dependency with:
 
-A valid block proves every declared dependency, so a contract may rely on `PCS_claim` once it checks that payload `j` of frame `i` declares it:
+```python
+def verify_leanpcs_dependency(dep, witness, state, proven) -> bool:
+    _, key, msg, gas, witness_len = dep       # gas = gas_limit + PCS_STATEMENT_GAS
+    if len(witness) != witness_len:
+        return False
+    statement, glue, glue_key, transcript = witness[:32], witness[32:52], witness[52:84], witness[84:]
+    # No EVM needed for these two checks.
+    if keccak256(glue + glue_key) != key:
+        return False
+    if statement not in proven:
+        return False
+    # Run the glue as EIP-8141 runs a custom verifier, and require it to return the statement.
+    if is_precompile(glue):
+        return False
+    ok, output = execute_pure_verifier(glue, glue_key + msg + transcript, gas - PCS_STATEMENT_GAS, state)
+    return ok and output == statement
+```
 
-1. `FRAMEPARAM(i, 0x02)` (the mode) is `DEP_VERIFY_FRAME_MODE`;
-2. the first byte of `FRAMEDATALOAD(0, i)` is `PCS_SCHEME`;
-3. `FRAMEDATALOAD(1 + 32 * j, i)` is `keccak256(PCS_claim)`.
+`state` is the block's pre-state, or the pool's current state in a mempool. `execute_pure_verifier` returns whether the call succeeded and its return data; it already fails on empty or delegated code. `proven` is every statement in `D` (below) if the proof covers `D`, and empty otherwise. The proof is the transaction's `statements_proof` in a mempool, the block's `aggregate` in a block.
 
-For a frame `PCS_SIG_SCHEME || s`, check 2 is that the first two bytes of `FRAMEDATALOAD(0, i)` are `PCS_SIG_SCHEME` and `s`, and check 3 is that bytes `32 * j` to `32 * j + 31` of the `signature` of entry `s`, read with `SIGDATACOPY`, are `keccak256(PCS_claim)`. `compute_sig_hash(tx)` does not cover these bytes. A contract therefore uses this form only if it also checks, in a `VERIFY` frame, that the `signature` of entry `s` is exactly the hashes of its proof's claims, in the order check 3 reads them (`SIGPARAM(s, 0x03)`, its length, is 32 times their number).
+#### Proving statements
 
-Arguments are written from the top of the stack, as EIP-8141 defines them: `FRAMEPARAM(frameIndex, param)`, `FRAMEDATALOAD(offset, frameIndex)`, `SIGPARAM(signatureIndex, param)` and `SIGDATACOPY(memOffset, dataOffset, length, signatureIndex)`.
+- **Dependency.** Each statement is the EIP-8288 dependency `(LEANSTARK_SCHEME, statement, PCS_VK_HASH)`, read from the witness rather than declared in a frame. The circuit identified by `PCS_VK_HASH`, fixed by the fork, takes PCS claims `c_0, ..., c_{k-1}` and their opening proofs, and checks `1 <= k <= MAX_PCS_CLAIMS_PER_STATEMENT`, `pcs_verify(c_i, opening_proof_i)` for every `i`, and that the ordered `c_i` hash to `statement`. EIP-8288's recursive STARK proves these dependencies from this circuit, or from inner recursive STARKs, under `AGGREGATED_VK`.
+- **Coverage.** The dependencies `D` of a transaction are `(LEANSTARK_SCHEME, w[:32], PCS_VK_HASH)` for each of its leanPCS witnesses `w`, sorted and deduplicated. For a block, `D` also includes EIP-8288's `dependencies(block)`. A proof **covers** `D` if it verifies under `AGGREGATED_VK` with public inputs `[get_deps_hash(D), AGGREGATED_VK]`.
+- **One digest encoding.** This EIP replaces EIP-8288's `get_deps_hash` for every list, in headers, wrappers, recursion and discards: `get_deps_hash(deps) = DEPS_HASH(concat(scheme || data_hash || verification_key_hash for each triple))`, with `scheme` as 31 zero bytes then the scheme byte, so lists of different schemes never share an encoding. Frames naming `LEANSTARK_SCHEME` stay invalid, and EIP-8288's leanSTARK limits and gas do not apply to statements.
 
-In a transaction eligible for EIP-8141's public mempool, dependency verification frames come after the validation prefix, since no recognized validation prefix contains one. Validation code can still read them: `FRAMEPARAM` and `FRAMEDATALOAD` also read later frames.
+#### Transport
+
+- **Pooled wrapper.** A transaction with a leanPCS claim travels in pooled wrapper version `1`, `FRAME_TX_TYPE || rlp([tx_body, 1, witnesses, blob_sidecar, statements_proof])`. `statements_proof`, at most `MAX_PCS_PROOF_BYTES`, covers the transaction's statements. At EIP-8141's acceptance step 2, a node rejects a version `0` wrapper of such a transaction and a version `1` wrapper of any other. At step 5, before reading any state, it checks every `glue_id` and the `statements_proof`. At step 6, it runs each glue. A failing wrapper is rejected; its `tx_hash` is not marked invalid.
+- **Block.** A block with a leanPCS claim carries `dependency_proof` version `1`, `0x01 || rlp([witnesses, aggregate])`, canonical with no trailing bytes. `witnesses` is as in version `0`, one raw witness per dependency in `block_dependencies(block)`, leanPCS witnesses included, since validators run their glue. `aggregate`, at most `MAX_PCS_PROOF_BYTES`, is EIP-8288's dependency proof, and `block_deps_hash = get_deps_hash(D)`. A block with a leanPCS claim is invalid if `aggregate` does not cover `D`, or if its `dependency_proof` has another version.
+
+#### Changes to EIP-8141
+
+- **Gas and length.** Unlike EIP-8141's other protocol verifiers, `LEANPCS_VERIFIER` takes its gas and witness length from the claim: its `resolve_claim_gas` is `gas_limit + PCS_STATEMENT_GAS`, and its `resolve_witness_len` is `witness_len`. `PCS_STATEMENT_GAS` pays for verifying and aggregating one statement. The witness is priced as a custom verifier's witness. `statements_proof` is not charged by the byte: it never reaches a block.
+- **Evaluation.** EIP-8141's direct evaluation never applies to a leanPCS claim: a node always runs its glue, and a proof alone never satisfies the claim.
+- **`MULFIELD`** is permitted in the pure context.
+
+### Using leanPCS claims
+
+- **A proof that signs its transaction.** An account stores its `glue_id` and checks `HASCLAIM(LEANPCS_VERIFIER, glue_id, 0)`. The glue runs the PIOP against `compute_sig_hash(tx)`, so it must fit the account's validation gas.
+- **An application proof.** An application whose PIOP does not depend on `compute_sig_hash(tx)` can run the PIOP in its own frame, with state access and no validation gas limit. It uses an **echo glue**: a contract `ECHO_GLUE`, pinned by the application, that always returns bytes 32 to 63 of its calldata (`resolved_msg`). The transaction declares `[LEANPCS_VERIFIER, keccak256(ECHO_GLUE || bytes32(0)), statement, gas_limit, 84]` with witness `statement || ECHO_GLUE || bytes32(0)`. The application binds its public inputs into the transcript, checks the PIOP, derives `statement` itself, and requires `HASCLAIM(LEANPCS_VERIFIER, keccak256(ECHO_GLUE || bytes32(0)), statement)`. Such a claim says only that `statement` is true, never that anything is authorized.
+
+A contract MUST name `LEANPCS_VERIFIER`, never the glue: a claim naming the glue as a custom verifier holds whenever the call succeeds, with no PCS claim proven. An echo that can return anything other than `resolved_msg` lets a forger pass another true statement under the application's `msg`.
 
 ## Rationale
 
 ### Benchmarks
 
-Gas follows EIP-8141 with [EIP-7976](./eip-7976.md)'s calldata floor (with [`MULFIELD`](./eip-draft-mulfield.md) at 10 gas), without the per-transaction and per-frame overheads: *PIOP* is the PIOP's frame, *Total* adds the frame of PCS claims and `pcs_gas`. *Prover* adds 0.1 s per claim for aggregating, client side, every PCS opening, into a common STARK. These figures come from the prototype, over $\mathrm{GF}(2^{192})$, and have not been measured again over $E$.
+These figures were measured under an earlier design of this EIP, with the PIOP in a frame, over the prototype's $\mathrm{GF}(2^{192})$. Under this EIP, the PIOP runs as the glue, its gas is the claim's `gas_limit`, its proof is the claim's witness, and each claim adds `PCS_STATEMENT_GAS`; the figures have to be measured again. *PIOP* is the PIOP's frame, *Total* adds the frame of PCS claims and that design's per-claim gas. *Prover* adds 0.1 s per claim for aggregating, client side, every PCS opening, into a common STARK.
 
 | Application | Prover (Apple M4 Max) | Calldata | PIOP | PCS claims | Total |
 |---|---|---|---|---|---|
 | Zero-knowledge membership in a Keccak-256 Merkle tree of depth 32 | 1.7 s | 273 bytes | 20,085 gas | 3 | 31,680 gas |
 | leanVM verification (here 128 leanXMSS signatures), i.e. any computation thanks to recursion | 3.6 s | 577 bytes | 40,396 gas | 7 | 63,328 gas |
 
-### Why a new dependency format
+### Why one verifier with a glue
 
-EIP-8288's triples, a statement's hash and a verification key's hash, are made for whole STARKs. Neither scheme here has a verification key. A signature needs its message and public key (64 bytes); a PCS claim needs only its hash (32 bytes), since the contract computes the claim itself.
+A STARK's PCS claims are computed from its transcript, so a transaction cannot list them before it is built, and cannot list them at all when the STARK signs the transaction. Something must compute them after signing: here, the glue. Making "glue plus PCS openings" one protocol verifier changes no transaction format:
 
-### Why PCS claims travel only in mode 1 wrappers
+- **Few new concepts.** One verifier, its glue and its statement. A claim names a verifier, and its key names a program and a public key, as for any other verifier. `HASCLAIM` keeps its meaning and other verifiers keep their rules.
+- **Known before execution.** `tx_body` fixes the glue's gas and witness length. Mempools and builders read each statement from its witness, so they know what the block must prove before running any glue.
+- **Fails closed.** The protocol compares the glue's output with `statement`. A glue that returns anything else fails, so a proof cannot be skipped.
+- **Permissionless.** Anyone can deploy a glue, for ML-DSA, Falcon or an application, without a new fork.
 
-The sender aggregates the openings of its transaction client side, into one STARK that it broadcasts in a mode 1 wrapper. The mempool then recursively aggregates only one STARK, whatever the number of PCS claims. `PCS_TX_GAS` pays for this per-transaction work: verifying and aggregating one more STARK. `PCS_CLAIM_GAS` pays for each claim's share: a dependency of the block.
+Two alternatives were considered. A custom verifier could call a PCS verifier that records each claim for later: the block learns how many claims to prove only by running the verifier, and a verifier that ignores the call's result passes without a proof. A claim could carry an extra field naming the verifier of a derived claim: that adds a field to every claim and gives other verifiers' return data a meaning.
+
+### Why one statement, proven only in aggregate
+
+The sender aggregates the openings of its transaction's statements, client side, into one STARK, `statements_proof`. The mempool and the block then aggregate one STARK per transaction, whatever its number of PCS claims, so a fixed `PCS_STATEMENT_GAS` per statement pays for this work: verifying and aggregating one more STARK, and one dependency of the block. Raw opening proofs are large, so they never reach a block.
 
 ### How a proof signs its transaction
 
-An account can be protected by a proof instead of a signature. Such a proof must attest to `compute_sig_hash(tx)`, like a signature.
-
-But this hash covers the `data` of every frame, and the PIOP proof and the PCS claims are computed from the hash. Conclusion: the PIOP proof and the PCS claims cannot be in frame data (circular dependency).
-
-Solution: put the PIOP bytes and the PCS claims where signatures go. In EIP-8141, the hash does not cover the `signature` bytes of an entry with an empty `msg` (it covers only their length). So the PIOP proof goes in one `ARBITRARY` entry, and the hashes of the PCS claims go in another, entry `s`. A frame `PCS_SIG_SCHEME || s` declares the hashes in entry `s` as PCS dependencies.
+An account can be protected by a proof instead of a signature. Such a proof must attest to `compute_sig_hash(tx)`, like a signature. The proof and its PCS claims are computed from this hash, so neither can be in `tx_body`. In a `LEANPCS_VERIFIER` claim with an empty `msg`, they are in the claim's witness, which `compute_sig_hash(tx)` does not cover.
 
 The sender:
 
-1. writes the transaction and fixes the lengths of the two entries;
+1. writes the transaction, with the claim's `gas_limit` and `witness_len`;
 2. computes `compute_sig_hash(tx)`;
-3. builds the proof, which attests to this hash;
-4. fills the two entries (PIOP proof / hashes of the PCS claims), which does not change the hash;
-5. opens the PCS claims and broadcasts the transaction.
+3. builds the proof, which attests to this hash, and its statement;
+4. fills the witness;
+5. aggregates the openings into one STARK and broadcasts the transaction.
 
-Anyone can change the bytes of the two entries without changing the hash. So, in a `VERIFY` frame, the contract:
-
-- checks that the PIOP proof is valid, with `TXPARAM(0x08)` (sighash) in its transcript (`SIGDATACOPY` followed by EVM execution);
-- checks that entry `s` holds exactly the hashes of the PIOP proof's claims (see [Reading PCS claims](#reading-pcs-claims));
-- checks that the transaction has a dependency frame of the form `PCS_SIG_SCHEME || s`, so that the block proves each PCS claim.
+The glue receives `compute_sig_hash(tx)` as `resolved_msg` and absorbs it into its transcript. Anyone can change the witness bytes, but the claim then holds only with another valid proof for the same key and transaction.
 
 ### Why a 128-bit field, with two out-of-domain answers
 
@@ -148,13 +172,13 @@ A commitment carries two out-of-domain answers because one is not enough in a fi
 
 ### Upgrades
 
-The field cannot change, but the PCS can: a future fork can add a version $v + 1$ that brings the latest performance improvements of PCSs. PCS opnings used to commit to witness can adapted without redeploying legacy smart contracts relying on leanPCS.Commitments stored in contracts, typically circuit verification keys, can be migrated, following this idea of JD:
+The field cannot change, but the PCS can: a future fork can add a version $v + 1$ that brings the latest performance improvements of PCSs. PCS openings used to commit to witnesses can be adapted without redeploying legacy smart contracts relying on leanPCS. Commitments stored in contracts, typically circuit verification keys, can be migrated, following this idea of JD:
 
-To migrate a stored commitment `com` (version $v$) to `com'` (version $v + 1$, same `n`), a contract derives two independent points $r^{(0)}, r^{(1)}$ from both commitments by Fiat-Shamir and requires its transaction to declare that `com` and `com'` take the same value at each point. Distinct polynomials pass with probability at most $(n / 2^{128})^2$ per attempt (Schwartz–Zippel). To keep migration trustless, the contract should add `com'` to its accepted commitments rather than replace `com` (see [Security Considerations](#security-considerations)).
+To migrate a stored commitment `com` (version $v$) to `com'` (version $v + 1$, same `n`), a contract derives two independent points $r^{(0)}, r^{(1)}$ from both commitments by Fiat-Shamir, takes from the prover the values $y^{(0)}, y^{(1)}$, and requires a claim (with the echo glue of [Using leanPCS claims](#using-leanpcs-claims)) whose statement hashes the four PCS claims that `com` and `com'` both take value $y^{(k)}$ at $r^{(k)}$. Distinct polynomials pass with probability at most $(n / 2^{128})^2$ per attempt (Schwartz–Zippel). To keep migration trustless, the contract should add `com'` to its accepted commitments rather than replace `com` (see [Security Considerations](#security-considerations)).
 
 ## Backwards Compatibility
 
-This EIP replaces the dependency format, the gas of PCS dependencies and the `LEANSTARK_SCHEME` of EIP-8288, which is not yet deployed. Nothing changes for existing transactions.
+This EIP adds one protocol verifier that, unlike EIP-8141's others, runs EVM code and reads state. It amends EIP-8141's claim constraints, `resolve_claim_gas`, `resolve_witness_len`, `verify_dependency`, direct evaluation of protocol verifiers, and acceptance steps 2, 5 and 6, and adds pooled wrapper version `1` and `dependency_proof` version `1`. It replaces EIP-8288's `get_deps_hash`. It changes no transaction format and no existing verifier.
 
 ## Reference Implementation
 
@@ -164,9 +188,9 @@ TODO
 
 ## Security Considerations
 
-**A proof is not tied to its transaction.** A declared claim only says that the claim is true. Anyone who sees a pending transaction can copy its proof, its frame of PCS claims and the STARK that proves them into another transaction, with other frames. So when a proof authorizes something (a payment, a call), what it authorizes has to be part of the application's own transcript, from the start. With the claims in a frame's `data`, the proof cannot commit to `compute_sig_hash(tx)`, as a signature does: that hash covers the frame's `data`, and the claims depend on the transcript. The contract has to hash the relevant parts of the transaction itself, for example the chain id, the sender, the nonce, the fees and the frames it authorizes.
+**An explicit message is not tied to its transaction.** A claim with an explicit `msg` only says that the glue accepts `msg` under `glue_key` and that the statement holds. Anyone who sees a pending transaction can copy the claim, its witness and its proof into another transaction. What the proof authorizes (a payment, a call) has to be part of `msg` or of the application's transcript, with a domain, the action and a nonce the application consumes. A claim with an empty `msg` is bound to its transaction through `compute_sig_hash(tx)`, like a signature.
 
-**Claims held in a signature entry need one more check.** With a frame `PCS_SIG_SCHEME || s`, a proof can commit to `compute_sig_hash(tx)` (`TXPARAM(0x08)`), provided nothing else that hash covers depends on the proof: the proof also travels in an `ARBITRARY` entry with an empty `msg`, and both entries have a length fixed before proving, since the hash covers their lengths and not their bytes. Anyone can then reorder the hashes in entry `s`, or replace them with the hashes of other true claims, and the hash does not change. If the contract checks entry `s` in a `VERIFY` frame, as [Reading PCS claims](#reading-pcs-claims) says, the altered transaction is invalid. No other frame can read these bytes. A contract with no `VERIFY` frame in the transaction, for example one that a `SENDER` frame calls after the sender's signature approves the transaction, uses claims held in a frame's `data`, which that signature covers.
+**The glue must bind its inputs.** The protocol checks what the glue returns, not how it computed it. A glue must absorb `glue_key` and `resolved_msg` into its transcript before drawing any challenge, derive every PCS claim itself, and return `statement` only once the PIOP checks pass. Its result must not depend on its gas, which the transaction chooses. A glue that skips any of this accepts proofs it should reject, and every contract trusting its `glue_id` inherits the flaw. With the echo glue, these duties fall on the application's frame.
 
 **Absorb the whole commitment.** A root alone can match several polynomials, and `ood` picks out one of them. When a commitment comes from the proof rather than from the contract, the application must hash both `root` and `ood` into its transcript before it draws any challenge that depends on the commitment, and use that `ood` in every claim on that commitment. If it hashes only the root, the prover chooses `ood` after seeing the challenges, and the application's soundness error is multiplied by up to the number of polynomials the root matches.
 
